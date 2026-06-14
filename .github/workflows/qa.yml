@@ -1,0 +1,22 @@
+name: QA Deployment
+
+on:
+  push:
+    branches:
+      - qa
+
+jobs:
+
+  deploy:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - run: echo "Running QA Validation"
+
+      - run: pytest
+
+      - run: echo "Deploying to QA Server"

@@ -1,0 +1,35 @@
+name: Pull Request Validation
+
+on:
+  pull_request:
+    branches:
+      - qa
+      - main
+
+jobs:
+
+  validate:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      - run: pylint app.py
+
+      - uses: gitleaks/gitleaks-action@v2
+
+      - run: pytest
+
+      - name: Sonar Scan
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
