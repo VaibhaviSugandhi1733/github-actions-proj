@@ -78,10 +78,4 @@ jobs:
 
       run: |
 
-        docker run -d \
-
-        --name flask-qa \
-
-        -p 5000:5000 \
-
-        flask-app:qa-${{ github.sha }}
+        docker run -d --name flask-qa -p 5000:5000 flask-app:qa-${{ github.sha }}
