@@ -20,48 +20,36 @@ jobs:
 
     steps:
 
-    - name: Checkout
+    - uses: actions/checkout@v4
 
-      uses: actions/checkout@v4
-
-    - name: Verify Python
-
-      run: |
-
-        python3 --version
-
-        pip3 --version
-
-    - name: Activate Virtual Env
-
-      run: |
-
-        source ~/github-runner-venv/bin/activate
-
-        python --version
-
-        pip install -r requirements.txt
-
-    - name: GitLeaks Scan
+    - name: GitLeaks
 
       uses: gitleaks/gitleaks-action@v2
 
-    # - name: Run Tests
-
-    #   run: |
-
-    #     python3 -m pytest \
-    #     --cov=. \
-    #     --cov-report=xml
-
-    - name: SonarQube Scan
-      uses: SonarSource/sonarqube-scan-action@v5
-      env:
-        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-
-    - name: Trivy Filesystem Scan
+    - name: Install dependencies
 
       run: |
 
-        trivy fs .
+        python3 -m pip install -r requirements.txt --break-system-packages
+
+    - name: Flake8
+
+      run: |
+
+        python3 -m flake8 .
+
+    - name: Unit Test
+
+      run: |
+
+        python3 -m pytest
+
+    - name: SonarQube
+
+      uses: SonarSource/sonarqube-scan-action@v6
+
+      env:
+
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
