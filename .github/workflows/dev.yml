@@ -1,43 +1,104 @@
-name: Development Pipeline
+name: DEV Pipeline
 
 on:
+
   push:
+
     branches:
-      - dev
+
+      - develop
 
 jobs:
 
-  build:
+  dev:
 
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
 
     steps:
 
-      - name: Checkout Code
-        uses: actions/checkout@v4
+    - name: Checkout Code
 
-      - name: Install Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      uses: actions/checkout@v4
 
-      - name: Install Packages
-        run: |
-          pip install -r requirements.txt
+    - name: GitLeaks Scan
 
-      - name: Lint Check
-        run: |
-          pylint app.py
+      uses: gitleaks/gitleaks-action@v2
 
-      - name: Gitleaks Scan
-        uses: gitleaks/gitleaks-action@v2
+    - name: Setup Python
 
-      - name: Run Unit Test
-        run: |
-          pytest
+      uses: actions/setup-python@v5
 
-      - name: SonarQube Scan
-        uses: SonarSource/sonarqube-scan-action@master
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      with:
+
+        python-version: "3.12"
+
+    - name: Install Dependencies
+
+      run: |
+
+        pip install -r requirements.txt
+
+    - name: Run Unit Tests
+
+      run: |
+
+        pytest
+
+    - name: SonarQube Scan
+
+      run: |
+
+        sonar-scanner \
+        -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }} \
+        -Dsonar.login=${{ secrets.SONAR_TOKEN }}
+
+    - name: Trivy Filesystem Scan
+
+      run: |
+
+        trivy fs .
+
+    - name: Build Docker Image
+
+      run: |
+
+        docker build \
+        -t myapp:dev-${{ github.sha }} .
+
+    - name: Trivy Image Scan
+
+      run: |
+
+        trivy image myapp:dev-${{ github.sha }}
+
+    - name: Login to ECR
+
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Push Docker Image
+
+      run: |
+
+        docker tag myapp:dev-${{ github.sha }} \
+        ${{ secrets.ECR_REPOSITORY }}:dev-${{ github.sha }}
+
+        docker push \
+        ${{ secrets.ECR_REPOSITORY }}:dev-${{ github.sha }}
+
+    - name: Configure kubeconfig
+
+      run: |
+
+        echo "${{ secrets.KUBECONFIG_DEV }}" > kubeconfig
+
+        export KUBECONFIG=$PWD/kubeconfig
+
+        kubectl get nodes
+
+    - name: Deploy DEV
+
+      run: |
+
+        export KUBECONFIG=$PWD/kubeconfig
+
+        kubectl apply -f k8s/dev/
