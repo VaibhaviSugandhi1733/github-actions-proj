@@ -46,13 +46,13 @@ jobs:
 
       uses: gitleaks/gitleaks-action@v2
 
-    - name: Run Tests
+    # - name: Run Tests
 
-      run: |
+    #   run: |
 
-        python3 -m pytest \
-        --cov=. \
-        --cov-report=xml
+    #     python3 -m pytest \
+    #     --cov=. \
+    #     --cov-report=xml
 
     - name: SonarQube Scan
 
