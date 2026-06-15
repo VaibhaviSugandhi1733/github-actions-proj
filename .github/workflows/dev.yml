@@ -24,13 +24,13 @@ jobs:
 
       uses: gitleaks/gitleaks-action@v2
 
-    - name: Setup Python
+    - name: Verify Python
 
-      uses: actions/setup-python@v5
+      run: |
 
-      with:
+        python3 --version
 
-        python-version: "3.11"
+        pip3 --version
 
     - name: Install Dependencies
 
