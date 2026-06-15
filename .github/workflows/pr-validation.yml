@@ -1,35 +1,63 @@
-name: Pull Request Validation
+name: PR Validation
 
 on:
+
   pull_request:
+
     branches:
+
+      - develop
+
       - qa
+
       - main
 
 jobs:
 
   validate:
 
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
 
     steps:
 
-      - uses: actions/checkout@v4
+    - name: Checkout
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      uses: actions/checkout@v4
 
-      - run: pip install -r requirements.txt
+    - name: Setup Python
 
-      - run: pylint app.py
+      uses: actions/setup-python@v5
 
-      - uses: gitleaks/gitleaks-action@v2
+      with:
 
-      - run: pytest
+        python-version: "3.12"
 
-      - name: Sonar Scan
-        uses: SonarSource/sonarqube-scan-action@master
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+    - name: Install Dependencies
+
+      run: |
+
+        pip install -r requirements.txt
+
+    - name: GitLeaks Scan
+
+      uses: gitleaks/gitleaks-action@v2
+
+    - name: Unit Tests
+
+      run: |
+
+        pytest
+
+    - name: SonarQube Scan
+
+      run: |
+
+        sonar-scanner \
+        -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }} \
+        -Dsonar.login=${{ secrets.SONAR_TOKEN }}
+
+    - name: Trivy Filesystem Scan
+
+      run: |
+
+        trivy fs .
