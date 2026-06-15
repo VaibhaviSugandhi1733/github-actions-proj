@@ -14,105 +14,74 @@ jobs:
 
     runs-on: self-hosted
 
-    environment:
-
-      name: production
-
     steps:
 
     - uses: actions/checkout@v4
 
-    - name: GitLeaks Scan
+    - name: GitLeaks
 
       uses: gitleaks/gitleaks-action@v2
 
-    - name: Verify Python
+    - name: Install dependencies
 
       run: |
 
-        python3 --version
+        python3 -m pip install -r requirements.txt --break-system-packages
 
-        pip3 --version
-
-    - name: Activate Virtual Env
+    - name: Flake8
 
       run: |
 
-        source ~/github-runner-venv/bin/activate
+        python3 -m flake8 .
 
-        python --version
+    - name: Unit Tests
 
-        pip install -r requirements.txt
-    # - name: Run Tests
+      run: |
 
-    #   run: |
+        python3 -m pytest
 
-    #     python3 -m pytest \
-    #     --cov=. \
-    #     --cov-report=xml
+    - name: SonarQube
 
-    - name: SonarQube Scan
-      uses: SonarSource/sonarqube-scan-action@v5
+      uses: SonarSource/sonarqube-scan-action@v6
+
       env:
+
         SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
         SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-    - name: Trivy Scan
+
+    - name: Trivy FS Scan
 
       run: |
 
         trivy fs .
 
-    - name: Build Docker
+    - name: Build Docker Image
 
       run: |
 
-        docker build \
-        -t myapp:prod-${{ github.sha }} .
+        docker build -t flask-app:prod-${{ github.sha }} .
 
-    - name: Scan Docker Image
-
-      run: |
-
-        trivy image myapp:prod-${{ github.sha }}
-
-    - name: Configure AWS Credentials
-
-      uses: aws-actions/configure-aws-credentials@v4
-
-      with:
-
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_ID }}
-
-        aws-region: ${{ secrets.AWS_REGION }}
-
-    - name: Login ECR
-
-      uses: aws-actions/amazon-ecr-login@v2
-
-    - name: Push Image
+    - name: Trivy Image Scan
 
       run: |
 
-        docker tag myapp:prod-${{ github.sha }} \
-        ${{ secrets.ECR_REPOSITORY }}:prod-${{ github.sha }}
+        trivy image flask-app:prod-${{ github.sha }}
 
-        docker push \
-        ${{ secrets.ECR_REPOSITORY }}:prod-${{ github.sha }}
-
-    - name: Configure kubeconfig
+    - name: Stop Existing Container
 
       run: |
 
-        echo "${{ secrets.KUBECONFIG_PROD }}" > kubeconfig
+        docker rm -f flask-prod || true
 
-        export KUBECONFIG=$PWD/kubeconfig
-
-    - name: Deploy PROD
+    - name: Run Container
 
       run: |
 
-        export KUBECONFIG=$PWD/kubeconfig
+        docker run -d \
 
-        kubectl apply -f k8s/prod/
+        --name flask-prod \
+
+        -p 80:5000 \
+
+        flask-app:prod-${{ github.sha }}
