@@ -30,7 +30,7 @@ spec:
 
       - name: flask
 
-        image: YOUR_ECR_REPO:latest
+        image: ${{ secrets.ECR_REPOSITORY }}:qa-${{ github.sha }}
 
         ports:
 
