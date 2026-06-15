@@ -1,22 +1,100 @@
-name: QA Deployment
+name: QA Pipeline
 
 on:
+
   push:
+
     branches:
+
       - qa
 
 jobs:
 
-  deploy:
+  qa:
 
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
 
     steps:
 
-      - uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-      - run: echo "Running QA Validation"
+    - name: GitLeaks Scan
 
-      - run: pytest
+      uses: gitleaks/gitleaks-action@v2
 
-      - run: echo "Deploying to QA Server"
+    - name: Setup Python
+
+      uses: actions/setup-python@v5
+
+      with:
+
+        python-version: "3.12"
+
+    - name: Install Dependencies
+
+      run: |
+
+        pip install -r requirements.txt
+
+    - name: Run Unit Tests
+
+      run: |
+
+        pytest
+
+    - name: SonarQube Scan
+
+      run: |
+
+        sonar-scanner \
+        -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }} \
+        -Dsonar.login=${{ secrets.SONAR_TOKEN }}
+
+    - name: Trivy Scan
+
+      run: |
+
+        trivy fs .
+
+    - name: Build Docker
+
+      run: |
+
+        docker build \
+        -t myapp:qa-${{ github.sha }} .
+
+    - name: Scan Docker Image
+
+      run: |
+
+        trivy image myapp:qa-${{ github.sha }}
+
+    - name: Login ECR
+
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Push Image
+
+      run: |
+
+        docker tag myapp:qa-${{ github.sha }} \
+        ${{ secrets.ECR_REPOSITORY }}:qa-${{ github.sha }}
+
+        docker push \
+        ${{ secrets.ECR_REPOSITORY }}:qa-${{ github.sha }}
+
+    - name: Configure kubeconfig
+
+      run: |
+
+        echo "${{ secrets.KUBECONFIG_QA }}" > kubeconfig
+
+        export KUBECONFIG=$PWD/kubeconfig
+
+    - name: Deploy QA
+
+      run: |
+
+        export KUBECONFIG=$PWD/kubeconfig
+
+        kubectl apply -f k8s/qa/
