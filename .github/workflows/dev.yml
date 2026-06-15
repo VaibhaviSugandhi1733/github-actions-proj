@@ -32,9 +32,13 @@ jobs:
 
         pip3 --version
 
-    - name: Install Dependencies
+    - name: Activate Virtual Env
 
       run: |
+
+        source ~/github-runner-venv/bin/activate
+
+        python --version
 
         pip install -r requirements.txt
 
