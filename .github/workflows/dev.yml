@@ -78,10 +78,5 @@ jobs:
 
       run: |
 
-        docker run -d \
-
-        --name flask-dev \
-
-        -p 5000:5000 \
-
-        flask-app:dev-${{ github.sha }}
+        docker run -d --name flask-dev -p 5000:5000 flask-app:dev-${{ github.sha }}
+        
