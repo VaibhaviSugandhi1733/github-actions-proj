@@ -7,7 +7,7 @@ on:
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
-  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  AWS_ACCOUNT_ID: ${{ steps.aws-account.outputs.id }}
   ECR_REPO_NAME: flask-app
   CLUSTER_NAME: flask-app-production-cluster
   SERVICE_NAME: flask-app-production-service
@@ -43,7 +43,7 @@ jobs:
 
       - name: Build and Push to ECR
         run: |
-          IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
+          IMAGE_URI="${steps.aws-account.outputs.id}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
           docker build -t "${IMAGE_URI}:${GITHUB_SHA}" .
           docker tag "${IMAGE_URI}:${GITHUB_SHA}" "${IMAGE_URI}:latest-production"
           docker push "${IMAGE_URI}:${GITHUB_SHA}"
@@ -63,7 +63,7 @@ jobs:
       - name: Register New Task Definition
         id: new-task
         run: |
-          IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}:${GITHUB_SHA}"
+          IMAGE_URI="${steps.aws-account.outputs.id}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}:${GITHUB_SHA}"
 
           TASK_DEF=$(aws ecs describe-task-definition \
             --task-definition "$TASK_FAMILY" \
