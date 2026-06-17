@@ -7,6 +7,13 @@ on:
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  ECR_REPO_NAME: flask-app
+  CLUSTER_NAME: flask-app-production-cluster
+  SERVICE_NAME: flask-app-production-service
+  TASK_FAMILY: flask-app-production-task
+  CONTAINER_NAME: flask-app
+  LOG_GROUP: /ecs/flask-app-production
 
 permissions:
   id-token: write
@@ -15,8 +22,7 @@ permissions:
 jobs:
   deploy-production:
     runs-on: ubuntu-latest
-    # Uncomment the line below and configure a "production" environment
-    # in Settings → Environments with required reviewers for manual approval.
+    # Uncomment for manual approval gate:
     # environment: production
     steps:
       - name: Checkout Code
@@ -28,7 +34,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Login to Amazon ECR
@@ -36,21 +42,19 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build and Push to ECR
-        env:
-          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t $ECR_REPOSITORY:$IMAGE_TAG .
-          docker tag $ECR_REPOSITORY:$IMAGE_TAG $ECR_REPOSITORY:latest
-          docker push $ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REPOSITORY:latest
+          IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
+          docker build -t "${IMAGE_URI}:${GITHUB_SHA}" .
+          docker tag "${IMAGE_URI}:${GITHUB_SHA}" "${IMAGE_URI}:latest-production"
+          docker push "${IMAGE_URI}:${GITHUB_SHA}"
+          docker push "${IMAGE_URI}:latest-production"
 
       - name: Get Current Task Definition
         id: current-task
         run: |
           CURRENT_ARN=$(aws ecs describe-services \
-            --cluster ${{ secrets.ECS_CLUSTER }} \
-            --services ${{ secrets.ECS_SERVICE }} \
+            --cluster "$CLUSTER_NAME" \
+            --services "$SERVICE_NAME" \
             --query 'services[0].taskDefinition' \
             --output text)
           echo "task_def_arn=$CURRENT_ARN" >> "$GITHUB_OUTPUT"
@@ -58,17 +62,16 @@ jobs:
 
       - name: Register New Task Definition
         id: new-task
-        env:
-          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ github.sha }}
         run: |
+          IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}:${GITHUB_SHA}"
+
           TASK_DEF=$(aws ecs describe-task-definition \
-            --task-definition ${{ secrets.ECS_TASK_DEFINITION }} \
+            --task-definition "$TASK_FAMILY" \
             --query 'taskDefinition')
 
           NEW_TASK_DEF=$(echo "$TASK_DEF" | jq \
-            --arg IMAGE "$ECR_REPOSITORY:$IMAGE_TAG" \
-            --arg CONTAINER "${{ secrets.ECS_CONTAINER_NAME }}" \
+            --arg IMAGE "$IMAGE_URI" \
+            --arg CONTAINER "$CONTAINER_NAME" \
             '.containerDefinitions |= map(
               if .name == $CONTAINER then .image = $IMAGE else . end
             )')
@@ -93,9 +96,9 @@ jobs:
       - name: Deploy to ECS
         run: |
           aws ecs update-service \
-            --cluster ${{ secrets.ECS_CLUSTER }} \
-            --service ${{ secrets.ECS_SERVICE }} \
-            --task-definition ${{ steps.new-task.outputs.new_task_def_arn }} \
+            --cluster "$CLUSTER_NAME" \
+            --service "$SERVICE_NAME" \
+            --task-definition "${{ steps.new-task.outputs.new_task_def_arn }}" \
             --force-new-deployment
 
       - name: Wait for Service Stability
@@ -103,8 +106,8 @@ jobs:
         run: |
           echo "Waiting for ECS service to stabilize..."
           if aws ecs wait services-stable \
-            --cluster ${{ secrets.ECS_CLUSTER }} \
-            --services ${{ secrets.ECS_SERVICE }}; then
+            --cluster "$CLUSTER_NAME" \
+            --services "$SERVICE_NAME"; then
             echo "stable=true" >> "$GITHUB_OUTPUT"
             echo "Service is stable with new deployment."
           else
@@ -117,19 +120,19 @@ jobs:
         run: |
           echo "Rolling back to: ${{ steps.current-task.outputs.task_def_arn }}"
           aws ecs update-service \
-            --cluster ${{ secrets.ECS_CLUSTER }} \
-            --service ${{ secrets.ECS_SERVICE }} \
-            --task-definition ${{ steps.current-task.outputs.task_def_arn }} \
+            --cluster "$CLUSTER_NAME" \
+            --service "$SERVICE_NAME" \
+            --task-definition "${{ steps.current-task.outputs.task_def_arn }}" \
             --force-new-deployment
 
           echo "Waiting for rollback to stabilize..."
           aws ecs wait services-stable \
-            --cluster ${{ secrets.ECS_CLUSTER }} \
-            --services ${{ secrets.ECS_SERVICE }}
+            --cluster "$CLUSTER_NAME" \
+            --services "$SERVICE_NAME"
           echo "Rollback complete."
 
       - name: Fail if Deployment Unstable
         if: steps.wait-stable.outputs.stable == 'false'
         run: |
-          echo "::error::Production deployment failed and was rolled back to the previous version."
+          echo "::error::Production deployment failed and was rolled back."
           exit 1
