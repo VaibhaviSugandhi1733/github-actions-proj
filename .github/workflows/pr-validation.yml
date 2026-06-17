@@ -1,55 +1,98 @@
-name: PR Validation
+name: Pull Request Validation
 
 on:
-
   pull_request:
-
     branches:
-
-      - develop
-
       - qa
-
       - main
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
-
   validate:
-
-    runs-on: self-hosted
-
+    runs-on: ubuntu-latest
     steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - uses: actions/checkout@v4
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    - name: GitLeaks
+      - name: Install Packages
+        run: pip install -r requirements.txt
 
-      uses: gitleaks/gitleaks-action@v2
+      - name: Lint Check
+        run: pylint app.py
 
-    - name: Install dependencies
+      - name: Gitleaks Scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      run: |
+      - name: Run Unit Tests
+        run: pytest
 
-        python3 -m pip install -r requirements.txt --break-system-packages
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
 
-    - name: Flake8
+  comment:
+    runs-on: ubuntu-latest
+    needs: validate
+    if: always()
+    steps:
+      - name: Post Success Comment
+        if: needs.validate.result == 'success'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                '## ✅ Pipeline Validation Passed',
+                '',
+                'All checks completed successfully:',
+                '- Lint check (pylint)',
+                '- Secret scanning (Gitleaks)',
+                '- Unit tests (pytest)',
+                '- SonarQube analysis',
+                '',
+                `**Commit:** \`${context.sha.substring(0, 7)}\``,
+                `**Run:** [View Details](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`
+              ].join('\n')
+            });
 
-      run: |
+      - name: Post Failure Comment
+        if: needs.validate.result == 'failure'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                '## ❌ Pipeline Validation Failed',
+                '',
+                'One or more checks did not pass. Please review the logs and fix the issues before merging.',
+                '',
+                `**Commit:** \`${context.sha.substring(0, 7)}\``,
+                `**Run:** [View Details](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`
+              ].join('\n')
+            });
 
-        python3 -m flake8 .
-
-    - name: Unit Test
-
-      run: |
-
-        python3 -m pytest
-
-    - name: SonarQube
-
-      uses: SonarSource/sonarqube-scan-action@v6
-
-      env:
-
-        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-
-        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      - name: Fail if Validation Failed
+        if: needs.validate.result == 'failure'
+        run: exit 1
