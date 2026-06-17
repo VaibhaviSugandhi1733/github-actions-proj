@@ -1,6 +1,6 @@
 name: Infrastructure Setup
 
-# Manually triggered — run once per environment to provision all AWS  resources.
+# Manually triggered —  run once per environment to provision all AWS  resources.
 # Safe to re-run: every step is idempotent (creates only if not exists).
 on:
   workflow_dispatch:
