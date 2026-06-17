@@ -8,7 +8,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     """Return the environment identifier."""
-    return "Dev Environment ClarityTTS by Vaibhavi123"
+    return "Dev Environment ClarityTTS by Vaibhavi"
 
 
 @app.route("/health")
