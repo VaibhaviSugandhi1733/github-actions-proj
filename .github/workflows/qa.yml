@@ -12,6 +12,13 @@ env:
   SERVICE_NAME: flask-app-qa-service
   TASK_FAMILY: flask-app-qa-task
   CONTAINER_NAME: flask-app
+  LOG_GROUP: /ecs/flask-app-qa
+  SG_NAME: flask-app-qa-sg
+  EXECUTION_ROLE_NAME: ecsTaskExecutionRole
+  TASK_ROLE_NAME: ecsTaskRole-flask-app
+  APP_PORT: "5000"
+  TASK_CPU: "256"
+  TASK_MEMORY: "512"
 
 permissions:
   id-token: write
@@ -41,7 +48,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Get AWS Account ID
@@ -49,17 +56,178 @@ jobs:
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
           echo "id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
+          echo "AWS Account ID: $ACCOUNT_ID"
+
+      # ════════════════════════════════════════════════════════════
+      #  INFRASTRUCTURE — idempotent, runs every time, skips if exists
+      # ════════════════════════════════════════════════════════════
+
+      - name: Ensure ECR Repository
+        run: |
+          aws ecr describe-repositories --repository-names "$ECR_REPO_NAME" > /dev/null 2>&1 \
+          || aws ecr create-repository \
+               --repository-name "$ECR_REPO_NAME" \
+               --image-scanning-configuration scanOnPush=true
+
+      - name: Ensure ECS Cluster
+        run: |
+          STATUS=$(aws ecs describe-clusters \
+            --clusters "$CLUSTER_NAME" \
+            --query 'clusters[0].status' --output text 2>/dev/null)
+
+          if [ "$STATUS" != "ACTIVE" ]; then
+            aws ecs create-cluster \
+              --cluster-name "$CLUSTER_NAME" \
+              --capacity-providers FARGATE \
+              --default-capacity-provider-strategy capacityProvider=FARGATE,weight=1
+            echo "Created cluster: $CLUSTER_NAME"
+          else
+            echo "Cluster already exists."
+          fi
+
+      - name: Ensure IAM Roles
+        env:
+          ACCOUNT_ID: ${{ steps.aws-account.outputs.id }}
+        run: |
+          TRUST_POLICY='{
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Effect": "Allow",
+              "Principal": { "Service": "ecs-tasks.amazonaws.com" },
+              "Action": "sts:AssumeRole"
+            }]
+          }'
+
+          # Execution role (ECR pull + CloudWatch logs)
+          if ! aws iam get-role --role-name "$EXECUTION_ROLE_NAME" > /dev/null 2>&1; then
+            aws iam create-role \
+              --role-name "$EXECUTION_ROLE_NAME" \
+              --assume-role-policy-document "$TRUST_POLICY"
+            aws iam attach-role-policy \
+              --role-name "$EXECUTION_ROLE_NAME" \
+              --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+            echo "Created execution role."
+          fi
+
+          # Task role (your app's AWS permissions)
+          if ! aws iam get-role --role-name "$TASK_ROLE_NAME" > /dev/null 2>&1; then
+            aws iam create-role \
+              --role-name "$TASK_ROLE_NAME" \
+              --assume-role-policy-document "$TRUST_POLICY"
+            echo "Created task role."
+          fi
+
+      - name: Ensure CloudWatch Log Group
+        run: |
+          aws logs describe-log-groups \
+            --log-group-name-prefix "$LOG_GROUP" \
+            --query "logGroups[?logGroupName=='$LOG_GROUP'].logGroupName" \
+            --output text | grep -q "$LOG_GROUP" \
+          || {
+            aws logs create-log-group --log-group-name "$LOG_GROUP"
+            aws logs put-retention-policy \
+              --log-group-name "$LOG_GROUP" \
+              --retention-in-days 30
+            echo "Created log group: $LOG_GROUP"
+          }
+
+      - name: Ensure Security Group
+        id: sg
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters Name=isDefault,Values=true \
+            --query 'Vpcs[0].VpcId' --output text)
+
+          SUBNET_CSV=$(aws ec2 describe-subnets \
+            --filters Name=vpc-id,Values=$VPC_ID \
+            --query 'Subnets[*].SubnetId' --output text | tr '\t' ',')
+
+          echo "vpc_id=$VPC_ID" >> "$GITHUB_OUTPUT"
+          echo "subnet_ids=$SUBNET_CSV" >> "$GITHUB_OUTPUT"
+
+          EXISTING_SG=$(aws ec2 describe-security-groups \
+            --filters Name=group-name,Values="$SG_NAME" Name=vpc-id,Values="$VPC_ID" \
+            --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null)
+
+          if [ "$EXISTING_SG" != "None" ] && [ -n "$EXISTING_SG" ]; then
+            echo "sg_id=$EXISTING_SG" >> "$GITHUB_OUTPUT"
+            echo "Security group exists: $EXISTING_SG"
+          else
+            SG_ID=$(aws ec2 create-security-group \
+              --group-name "$SG_NAME" \
+              --description "SG for flask-app QA" \
+              --vpc-id "$VPC_ID" \
+              --query 'GroupId' --output text)
+            aws ec2 authorize-security-group-ingress \
+              --group-id "$SG_ID" --protocol tcp --port "$APP_PORT" --cidr 0.0.0.0/0
+            echo "sg_id=$SG_ID" >> "$GITHUB_OUTPUT"
+            echo "Created security group: $SG_ID"
+          fi
+
+      - name: Ensure Task Definition
+        env:
+          ACCOUNT_ID: ${{ steps.aws-account.outputs.id }}
+        run: |
+          aws ecs describe-task-definition --task-definition "$TASK_FAMILY" > /dev/null 2>&1 \
+          || aws ecs register-task-definition \
+               --family "$TASK_FAMILY" \
+               --network-mode awsvpc \
+               --requires-compatibilities FARGATE \
+               --cpu "$TASK_CPU" \
+               --memory "$TASK_MEMORY" \
+               --execution-role-arn "arn:aws:iam::${ACCOUNT_ID}:role/${EXECUTION_ROLE_NAME}" \
+               --task-role-arn "arn:aws:iam::${ACCOUNT_ID}:role/${TASK_ROLE_NAME}" \
+               --container-definitions "[{
+                 \"name\": \"${CONTAINER_NAME}\",
+                 \"image\": \"${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}:latest\",
+                 \"essential\": true,
+                 \"portMappings\": [{\"containerPort\": ${APP_PORT}, \"protocol\": \"tcp\"}],
+                 \"logConfiguration\": {
+                   \"logDriver\": \"awslogs\",
+                   \"options\": {
+                     \"awslogs-group\": \"${LOG_GROUP}\",
+                     \"awslogs-region\": \"${AWS_REGION}\",
+                     \"awslogs-stream-prefix\": \"ecs\"
+                   }
+                 },
+                 \"healthCheck\": {
+                   \"command\": [\"CMD-SHELL\", \"curl -f http://localhost:${APP_PORT}/ || exit 1\"],
+                   \"interval\": 30, \"timeout\": 5, \"retries\": 3, \"startPeriod\": 60
+                 }
+               }]"
+
+      - name: Ensure ECS Service
+        run: |
+          ACTIVE=$(aws ecs describe-services \
+            --cluster "$CLUSTER_NAME" \
+            --services "$SERVICE_NAME" \
+            --query 'services[?status==`ACTIVE`].serviceName' \
+            --output text 2>/dev/null)
+
+          if [ "$ACTIVE" != "$SERVICE_NAME" ]; then
+            aws ecs create-service \
+              --cluster "$CLUSTER_NAME" \
+              --service-name "$SERVICE_NAME" \
+              --task-definition "$TASK_FAMILY" \
+              --desired-count 1 \
+              --launch-type FARGATE \
+              --deployment-configuration "minimumHealthyPercent=100,maximumPercent=200" \
+              --network-configuration "awsvpcConfiguration={
+                subnets=[${{ steps.sg.outputs.subnet_ids }}],
+                securityGroups=[${{ steps.sg.outputs.sg_id }}],
+                assignPublicIp=ENABLED
+              }"
+            echo "Created ECS service: $SERVICE_NAME"
+          else
+            echo "ECS service already exists."
+          fi
+
+      # ════════════════════════════════════════════════════════════
+      #  BUILD + DEPLOY
+      # ════════════════════════════════════════════════════════════
 
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Ensure ECR Repository Exists
-        run: |
-          aws ecr describe-repositories \
-            --repository-names "$ECR_REPO_NAME" > /dev/null 2>&1 \
-          || aws ecr create-repository \
-            --repository-name "$ECR_REPO_NAME" \
-            --image-scanning-configuration scanOnPush=true
 
       - name: Build and Push to ECR
         env:
@@ -130,7 +298,7 @@ jobs:
             --cluster "$CLUSTER_NAME" \
             --services "$SERVICE_NAME"; then
             echo "stable=true" >> "$GITHUB_OUTPUT"
-            echo "Service is stable with new deployment."
+            echo "Service is stable."
           else
             echo "stable=false" >> "$GITHUB_OUTPUT"
             echo "Service did NOT stabilize. Will rollback."
@@ -145,8 +313,6 @@ jobs:
             --service "$SERVICE_NAME" \
             --task-definition "${{ steps.current-task.outputs.task_def_arn }}" \
             --force-new-deployment
-
-          echo "Waiting for rollback to stabilize..."
           aws ecs wait services-stable \
             --cluster "$CLUSTER_NAME" \
             --services "$SERVICE_NAME"
@@ -155,5 +321,5 @@ jobs:
       - name: Fail if Deployment Unstable
         if: steps.wait-stable.outputs.stable == 'false'
         run: |
-          echo "::error::QA deployment failed and was rolled back to the previous version."
+          echo "::error::QA deployment failed and was rolled back."
           exit 1
