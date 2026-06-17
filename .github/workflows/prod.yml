@@ -1,81 +1,135 @@
-name: PROD Pipeline
+name: Production Deployment
 
 on:
-
   push:
-
     branches:
-
       - main
 
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
-
-  prod:
-
-    runs-on: self-hosted
-
+  deploy-production:
+    runs-on: ubuntu-latest
+    # Uncomment the line below and configure a "production" environment
+    # in Settings → Environments with required reviewers for manual approval.
+    # environment: production
     steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - uses: actions/checkout@v4
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
-    - name: GitLeaks
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
 
-      uses: gitleaks/gitleaks-action@v2
+      - name: Build and Push to ECR
+        env:
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REPOSITORY:$IMAGE_TAG $ECR_REPOSITORY:latest
+          docker push $ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REPOSITORY:latest
 
-    - name: Install dependencies
+      - name: Get Current Task Definition
+        id: current-task
+        run: |
+          CURRENT_ARN=$(aws ecs describe-services \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --services ${{ secrets.ECS_SERVICE }} \
+            --query 'services[0].taskDefinition' \
+            --output text)
+          echo "task_def_arn=$CURRENT_ARN" >> "$GITHUB_OUTPUT"
+          echo "Captured current task definition: $CURRENT_ARN"
 
-      run: |
+      - name: Register New Task Definition
+        id: new-task
+        env:
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition ${{ secrets.ECS_TASK_DEFINITION }} \
+            --query 'taskDefinition')
 
-        python3 -m pip install -r requirements.txt --break-system-packages
+          NEW_TASK_DEF=$(echo "$TASK_DEF" | jq \
+            --arg IMAGE "$ECR_REPOSITORY:$IMAGE_TAG" \
+            --arg CONTAINER "${{ secrets.ECS_CONTAINER_NAME }}" \
+            '.containerDefinitions |= map(
+              if .name == $CONTAINER then .image = $IMAGE else . end
+            )')
 
-    - name: Flake8
+          CLEANED=$(echo "$NEW_TASK_DEF" | jq 'del(
+            .taskDefinitionArn,
+            .revision,
+            .status,
+            .requiresAttributes,
+            .compatibilities,
+            .registeredAt,
+            .registeredBy
+          )')
 
-      run: |
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$CLEANED" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "new_task_def_arn=$NEW_ARN" >> "$GITHUB_OUTPUT"
+          echo "Registered new task definition: $NEW_ARN"
 
-        python3 -m flake8 .
+      - name: Deploy to ECS
+        run: |
+          aws ecs update-service \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --service ${{ secrets.ECS_SERVICE }} \
+            --task-definition ${{ steps.new-task.outputs.new_task_def_arn }} \
+            --force-new-deployment
 
-    - name: Unit Tests
+      - name: Wait for Service Stability
+        id: wait-stable
+        run: |
+          echo "Waiting for ECS service to stabilize..."
+          if aws ecs wait services-stable \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --services ${{ secrets.ECS_SERVICE }}; then
+            echo "stable=true" >> "$GITHUB_OUTPUT"
+            echo "Service is stable with new deployment."
+          else
+            echo "stable=false" >> "$GITHUB_OUTPUT"
+            echo "Service did NOT stabilize. Will rollback."
+          fi
 
-      run: |
+      - name: Rollback on Failure
+        if: steps.wait-stable.outputs.stable == 'false'
+        run: |
+          echo "Rolling back to: ${{ steps.current-task.outputs.task_def_arn }}"
+          aws ecs update-service \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --service ${{ secrets.ECS_SERVICE }} \
+            --task-definition ${{ steps.current-task.outputs.task_def_arn }} \
+            --force-new-deployment
 
-        python3 -m pytest
+          echo "Waiting for rollback to stabilize..."
+          aws ecs wait services-stable \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --services ${{ secrets.ECS_SERVICE }}
+          echo "Rollback complete."
 
-    - name: SonarQube
-
-      uses: SonarSource/sonarqube-scan-action@v6
-
-      env:
-
-        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-
-        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-
-    - name: Trivy FS Scan
-
-      run: |
-
-        trivy fs .
-
-    - name: Build Docker Image
-
-      run: |
-
-        docker build -t flask-app:prod-${{ github.sha }} .
-
-    - name: Trivy Image Scan
-
-      run: |
-
-        trivy image flask-app:prod-${{ github.sha }}
-
-    - name: Stop Existing Container
-
-      run: |
-
-        docker rm -f flask-prod || true
-
-    - name: Run Container
-
-      run: |
-
-        docker run -d --name flask-prod -p 5000:5000 flask-app:prod-${{ github.sha }}
+      - name: Fail if Deployment Unstable
+        if: steps.wait-stable.outputs.stable == 'false'
+        run: |
+          echo "::error::Production deployment failed and was rolled back to the previous version."
+          exit 1
