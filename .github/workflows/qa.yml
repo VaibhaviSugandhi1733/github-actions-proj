@@ -1,81 +1,151 @@
-name: QA Pipeline
+name: QA Deployment
 
 on:
-
   push:
-
     branches:
-
       - qa
 
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPO_NAME: flask-app
+  CLUSTER_NAME: flask-app-qa-cluster
+  SERVICE_NAME: flask-app-qa-service
+  TASK_FAMILY: flask-app-qa-task
+  CONTAINER_NAME: flask-app
+
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
-
-  dev:
-
-    runs-on: self-hosted
-
+  deploy-qa:
+    runs-on: ubuntu-latest
     steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - uses: actions/checkout@v4
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    - name: GitLeaks
+      - name: Install Packages
+        run: pip install -r requirements.txt
 
-      uses: gitleaks/gitleaks-action@v2
+      - name: Run Unit Tests
+        run: pytest
 
-    - name: Install dependencies
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_ID }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
-      run: |
+      - name: Get AWS Account ID
+        id: aws-account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+          echo "id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
 
-        python3 -m pip install -r requirements.txt --break-system-packages
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
 
-    - name: Flake8
+      - name: Build and Push to ECR
+        env:
+          IMAGE_URI: ${{ steps.aws-account.outputs.id }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/flask-app
+        run: |
+          docker build -t "${IMAGE_URI}:${GITHUB_SHA}" .
+          docker tag "${IMAGE_URI}:${GITHUB_SHA}" "${IMAGE_URI}:latest"
+          docker push "${IMAGE_URI}:${GITHUB_SHA}"
+          docker push "${IMAGE_URI}:latest"
 
-      run: |
+      - name: Get Current Task Definition
+        id: current-task
+        run: |
+          CURRENT_ARN=$(aws ecs describe-services \
+            --cluster "$CLUSTER_NAME" \
+            --services "$SERVICE_NAME" \
+            --query 'services[0].taskDefinition' \
+            --output text)
+          echo "task_def_arn=$CURRENT_ARN" >> "$GITHUB_OUTPUT"
+          echo "Captured current task definition: $CURRENT_ARN"
 
-        python3 -m flake8 .
+      - name: Register New Task Definition
+        id: new-task
+        env:
+          IMAGE_URI: ${{ steps.aws-account.outputs.id }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/flask-app:${{ github.sha }}
+        run: |
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition "$TASK_FAMILY" \
+            --query 'taskDefinition')
 
-    - name: Unit Tests
+          NEW_TASK_DEF=$(echo "$TASK_DEF" | jq \
+            --arg IMAGE "$IMAGE_URI" \
+            --arg CONTAINER "$CONTAINER_NAME" \
+            '.containerDefinitions |= map(
+              if .name == $CONTAINER then .image = $IMAGE else . end
+            )')
 
-      run: |
+          CLEANED=$(echo "$NEW_TASK_DEF" | jq 'del(
+            .taskDefinitionArn,
+            .revision,
+            .status,
+            .requiresAttributes,
+            .compatibilities,
+            .registeredAt,
+            .registeredBy
+          )')
 
-        python3 -m pytest
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$CLEANED" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "new_task_def_arn=$NEW_ARN" >> "$GITHUB_OUTPUT"
+          echo "Registered new task definition: $NEW_ARN"
 
-    - name: SonarQube
+      - name: Deploy to ECS
+        run: |
+          aws ecs update-service \
+            --cluster "$CLUSTER_NAME" \
+            --service "$SERVICE_NAME" \
+            --task-definition "${{ steps.new-task.outputs.new_task_def_arn }}" \
+            --force-new-deployment
 
-      uses: SonarSource/sonarqube-scan-action@v6
+      - name: Wait for Service Stability
+        id: wait-stable
+        run: |
+          echo "Waiting for ECS service to stabilize..."
+          if aws ecs wait services-stable \
+            --cluster "$CLUSTER_NAME" \
+            --services "$SERVICE_NAME"; then
+            echo "stable=true" >> "$GITHUB_OUTPUT"
+            echo "Service is stable with new deployment."
+          else
+            echo "stable=false" >> "$GITHUB_OUTPUT"
+            echo "Service did NOT stabilize. Will rollback."
+          fi
 
-      env:
+      - name: Rollback on Failure
+        if: steps.wait-stable.outputs.stable == 'false'
+        run: |
+          echo "Rolling back to: ${{ steps.current-task.outputs.task_def_arn }}"
+          aws ecs update-service \
+            --cluster "$CLUSTER_NAME" \
+            --service "$SERVICE_NAME" \
+            --task-definition "${{ steps.current-task.outputs.task_def_arn }}" \
+            --force-new-deployment
 
-        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          echo "Waiting for rollback to stabilize..."
+          aws ecs wait services-stable \
+            --cluster "$CLUSTER_NAME" \
+            --services "$SERVICE_NAME"
+          echo "Rollback complete."
 
-        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-
-    - name: Trivy FS Scan
-
-      run: |
-
-        trivy fs .
-
-    - name: Build Docker Image
-
-      run: |
-
-        docker build -t flask-app:qa-${{ github.sha }} .
-
-    - name: Trivy Image Scan
-
-      run: |
-
-        trivy image flask-app:qa-${{ github.sha }}
-
-    - name: Stop Existing Container
-
-      run: |
-
-        docker rm -f flask-qa || true
-
-    - name: Run Container
-
-      run: |
-
-        docker run -d --name flask-qa -p 5000:5000 flask-app:qa-${{ github.sha }}
+      - name: Fail if Deployment Unstable
+        if: steps.wait-stable.outputs.stable == 'false'
+        run: |
+          echo "::error::QA deployment failed and was rolled back to the previous version."
+          exit 1
