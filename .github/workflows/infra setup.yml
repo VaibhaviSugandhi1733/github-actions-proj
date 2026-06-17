@@ -1,0 +1,372 @@
+name: Infrastructure Setup
+
+# Manually triggered — run once per environment to provision all AWS resources.
+# Safe to re-run: every step is idempotent (creates only if not exists).
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - qa
+          - production
+      app_port:
+        description: "Container port your app listens on"
+        required: true
+        default: "5000"
+      cpu:
+        description: "Task CPU (Fargate units: 256, 512, 1024, 2048, 4096)"
+        required: true
+        default: "256"
+      memory:
+        description: "Task Memory (MB: 512, 1024, 2048, etc.)"
+        required: true
+        default: "512"
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  # ─── Resource naming convention ───
+  # Change these if you want different names.
+  # Deploy workflows MUST use the same values.
+  APP_NAME: flask-app
+  ECR_REPO_NAME: flask-app
+  CLUSTER_NAME: flask-app-${{ inputs.environment }}-cluster
+  SERVICE_NAME: flask-app-${{ inputs.environment }}-service
+  TASK_FAMILY: flask-app-${{ inputs.environment }}-task
+  CONTAINER_NAME: flask-app
+  LOG_GROUP: /ecs/flask-app-${{ inputs.environment }}
+  SG_NAME: flask-app-${{ inputs.environment }}-sg
+  EXECUTION_ROLE_NAME: ecsTaskExecutionRole
+  TASK_ROLE_NAME: ecsTaskRole-flask-app
+
+permissions:
+  contents: read
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # ──────────────────────────────────────────────────────────────
+      # STEP 1: ECR Repository
+      # ──────────────────────────────────────────────────────────────
+      # Creates the private container registry where Docker images are
+      # pushed. The ECR repo is shared across environments (QA and prod
+      # use different image tags, not different repos).
+      - name: Create ECR Repository
+        run: |
+          if aws ecr describe-repositories \
+            --repository-names "$ECR_REPO_NAME" > /dev/null 2>&1; then
+            echo "ECR repository '$ECR_REPO_NAME' already exists. Skipping."
+          else
+            aws ecr create-repository \
+              --repository-name "$ECR_REPO_NAME" \
+              --image-scanning-configuration scanOnPush=true \
+              --encryption-configuration encryptionType=AES256
+            echo "Created ECR repository: $ECR_REPO_NAME"
+          fi
+
+          # Set lifecycle policy to keep only the last 30 images
+          # (prevents unbounded storage costs)
+          aws ecr put-lifecycle-policy \
+            --repository-name "$ECR_REPO_NAME" \
+            --lifecycle-policy-text '{
+              "rules": [{
+                "rulePriority": 1,
+                "description": "Keep last 30 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 30
+                },
+                "action": { "type": "expire" }
+              }]
+            }'
+          echo "ECR lifecycle policy applied (retain last 30 images)."
+
+      # ──────────────────────────────────────────────────────────────
+      # STEP 2: ECS Cluster
+      # ──────────────────────────────────────────────────────────────
+      # The cluster is a logical grouping for your services and tasks.
+      # With Fargate, there are no EC2 instances to manage — AWS
+      # provisions compute on demand per task.
+      - name: Create ECS Cluster
+        run: |
+          EXISTING=$(aws ecs describe-clusters \
+            --clusters "$CLUSTER_NAME" \
+            --query 'clusters[?status==`ACTIVE`].clusterName' \
+            --output text)
+
+          if [ "$EXISTING" = "$CLUSTER_NAME" ]; then
+            echo "ECS cluster '$CLUSTER_NAME' already exists. Skipping."
+          else
+            aws ecs create-cluster \
+              --cluster-name "$CLUSTER_NAME" \
+              --capacity-providers FARGATE \
+              --default-capacity-provider-strategy \
+                capacityProvider=FARGATE,weight=1
+            echo "Created ECS cluster: $CLUSTER_NAME"
+          fi
+
+      # ──────────────────────────────────────────────────────────────
+      # STEP 3: IAM Roles
+      # ──────────────────────────────────────────────────────────────
+      # Two roles are needed:
+      #
+      # Execution Role — used by the ECS agent to pull images from ECR
+      # and push logs to CloudWatch. This is NOT your app's permissions.
+      #
+      # Task Role — assumed by your running container. If your app needs
+      # to call AWS services (S3, SQS, DynamoDB, etc.), attach policies
+      # to this role. Starts empty.
+      - name: Create ECS Task Execution Role
+        run: |
+          if aws iam get-role --role-name "$EXECUTION_ROLE_NAME" > /dev/null 2>&1; then
+            echo "Execution role '$EXECUTION_ROLE_NAME' already exists. Skipping."
+          else
+            aws iam create-role \
+              --role-name "$EXECUTION_ROLE_NAME" \
+              --assume-role-policy-document '{
+                "Version": "2012-10-17",
+                "Statement": [{
+                  "Effect": "Allow",
+                  "Principal": { "Service": "ecs-tasks.amazonaws.com" },
+                  "Action": "sts:AssumeRole"
+                }]
+              }'
+
+            aws iam attach-role-policy \
+              --role-name "$EXECUTION_ROLE_NAME" \
+              --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+            echo "Created and configured execution role: $EXECUTION_ROLE_NAME"
+          fi
+
+      - name: Create ECS Task Role
+        run: |
+          if aws iam get-role --role-name "$TASK_ROLE_NAME" > /dev/null 2>&1; then
+            echo "Task role '$TASK_ROLE_NAME' already exists. Skipping."
+          else
+            aws iam create-role \
+              --role-name "$TASK_ROLE_NAME" \
+              --assume-role-policy-document '{
+                "Version": "2012-10-17",
+                "Statement": [{
+                  "Effect": "Allow",
+                  "Principal": { "Service": "ecs-tasks.amazonaws.com" },
+                  "Action": "sts:AssumeRole"
+                }]
+              }'
+            echo "Created task role: $TASK_ROLE_NAME"
+            echo "Attach additional policies to this role if your app needs AWS access (S3, SQS, etc.)"
+          fi
+
+      # ──────────────────────────────────────────────────────────────
+      # STEP 4: CloudWatch Log Group
+      # ──────────────────────────────────────────────────────────────
+      # Container stdout/stderr is forwarded here by the awslogs driver.
+      # 30-day retention keeps costs manageable.
+      - name: Create CloudWatch Log Group
+        run: |
+          if aws logs describe-log-groups \
+            --log-group-name-prefix "$LOG_GROUP" \
+            --query "logGroups[?logGroupName=='$LOG_GROUP'].logGroupName" \
+            --output text | grep -q "$LOG_GROUP"; then
+            echo "Log group '$LOG_GROUP' already exists. Skipping."
+          else
+            aws logs create-log-group --log-group-name "$LOG_GROUP"
+            aws logs put-retention-policy \
+              --log-group-name "$LOG_GROUP" \
+              --retention-in-days 30
+            echo "Created log group: $LOG_GROUP (30-day retention)"
+          fi
+
+      # ──────────────────────────────────────────────────────────────
+      # STEP 5: Networking (Default VPC + Security Group)
+      # ──────────────────────────────────────────────────────────────
+      # Fargate tasks need a VPC, subnets, and a security group.
+      # This uses your default VPC for simplicity. For production,
+      # you'd typically create a dedicated VPC with private subnets
+      # and a load balancer in public subnets.
+      - name: Get Default VPC and Subnets
+        id: vpc
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters Name=isDefault,Values=true \
+            --query 'Vpcs[0].VpcId' --output text)
+
+          if [ "$VPC_ID" = "None" ] || [ -z "$VPC_ID" ]; then
+            echo "::error::No default VPC found. Create one with: aws ec2 create-default-vpc"
+            exit 1
+          fi
+
+          SUBNET_IDS=$(aws ec2 describe-subnets \
+            --filters Name=vpc-id,Values=$VPC_ID \
+            --query 'Subnets[*].SubnetId' --output text)
+
+          # Convert space-separated to comma-separated for ECS
+          SUBNET_CSV=$(echo "$SUBNET_IDS" | tr '\t' ',')
+
+          echo "vpc_id=$VPC_ID" >> "$GITHUB_OUTPUT"
+          echo "subnet_ids=$SUBNET_CSV" >> "$GITHUB_OUTPUT"
+          echo "Default VPC: $VPC_ID"
+          echo "Subnets: $SUBNET_CSV"
+
+      - name: Create Security Group
+        id: sg
+        run: |
+          # Check if SG already exists
+          EXISTING_SG=$(aws ec2 describe-security-groups \
+            --filters Name=group-name,Values="$SG_NAME" \
+                      Name=vpc-id,Values="${{ steps.vpc.outputs.vpc_id }}" \
+            --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null)
+
+          if [ "$EXISTING_SG" != "None" ] && [ -n "$EXISTING_SG" ]; then
+            echo "Security group '$SG_NAME' already exists: $EXISTING_SG"
+            echo "sg_id=$EXISTING_SG" >> "$GITHUB_OUTPUT"
+          else
+            SG_ID=$(aws ec2 create-security-group \
+              --group-name "$SG_NAME" \
+              --description "Security group for $APP_NAME ${{ inputs.environment }}" \
+              --vpc-id "${{ steps.vpc.outputs.vpc_id }}" \
+              --query 'GroupId' --output text)
+
+            # Allow inbound traffic on the app port
+            aws ec2 authorize-security-group-ingress \
+              --group-id "$SG_ID" \
+              --protocol tcp \
+              --port "${{ inputs.app_port }}" \
+              --cidr 0.0.0.0/0
+
+            # Allow all outbound (default, but explicit)
+            echo "Created security group: $SG_ID"
+            echo "sg_id=$SG_ID" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ──────────────────────────────────────────────────────────────
+      # STEP 6: Task Definition
+      # ──────────────────────────────────────────────────────────────
+      # Registers the initial task definition with a placeholder image.
+      # The deploy workflow will update the image on every deployment.
+      # This is just the skeleton — you'll customize environment
+      # variables, health checks, etc. after the first run.
+      - name: Register Initial Task Definition
+        run: |
+          # Check if a revision already exists
+          EXISTING=$(aws ecs describe-task-definition \
+            --task-definition "$TASK_FAMILY" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text 2>/dev/null) || true
+
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "None" ]; then
+            echo "Task definition '$TASK_FAMILY' already has revisions. Skipping."
+            echo "Current: $EXISTING"
+          else
+            aws ecs register-task-definition \
+              --family "$TASK_FAMILY" \
+              --network-mode awsvpc \
+              --requires-compatibilities FARGATE \
+              --cpu "${{ inputs.cpu }}" \
+              --memory "${{ inputs.memory }}" \
+              --execution-role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${EXECUTION_ROLE_NAME}" \
+              --task-role-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:role/${TASK_ROLE_NAME}" \
+              --container-definitions "[
+                {
+                  \"name\": \"${CONTAINER_NAME}\",
+                  \"image\": \"${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}:latest\",
+                  \"essential\": true,
+                  \"portMappings\": [{
+                    \"containerPort\": ${{ inputs.app_port }},
+                    \"protocol\": \"tcp\"
+                  }],
+                  \"logConfiguration\": {
+                    \"logDriver\": \"awslogs\",
+                    \"options\": {
+                      \"awslogs-group\": \"${LOG_GROUP}\",
+                      \"awslogs-region\": \"${AWS_REGION}\",
+                      \"awslogs-stream-prefix\": \"ecs\"
+                    }
+                  },
+                  \"healthCheck\": {
+                    \"command\": [\"CMD-SHELL\", \"curl -f http://localhost:${{ inputs.app_port }}/ || exit 1\"],
+                    \"interval\": 30,
+                    \"timeout\": 5,
+                    \"retries\": 3,
+                    \"startPeriod\": 60
+                  }
+                }
+              ]"
+            echo "Registered initial task definition: $TASK_FAMILY"
+          fi
+
+      # ──────────────────────────────────────────────────────────────
+      # STEP 7: ECS Service
+      # ──────────────────────────────────────────────────────────────
+      # Creates the Fargate service with 1 desired task. The service
+      # maintains the desired count — if a task crashes, ECS
+      # automatically launches a replacement.
+      #
+      # NOTE: The first deploy will fail if you haven't pushed an
+      # image to ECR yet. That's expected — run the deploy workflow
+      # after this to push the first image.
+      - name: Create ECS Service
+        run: |
+          # Check if service exists and is active
+          EXISTING=$(aws ecs describe-services \
+            --cluster "$CLUSTER_NAME" \
+            --services "$SERVICE_NAME" \
+            --query 'services[?status==`ACTIVE`].serviceName' \
+            --output text 2>/dev/null)
+
+          if [ "$EXISTING" = "$SERVICE_NAME" ]; then
+            echo "ECS service '$SERVICE_NAME' already exists. Skipping."
+          else
+            aws ecs create-service \
+              --cluster "$CLUSTER_NAME" \
+              --service-name "$SERVICE_NAME" \
+              --task-definition "$TASK_FAMILY" \
+              --desired-count 1 \
+              --launch-type FARGATE \
+              --deployment-configuration \
+                "minimumHealthyPercent=100,maximumPercent=200" \
+              --network-configuration \
+                "awsvpcConfiguration={
+                  subnets=[${{ steps.vpc.outputs.subnet_ids }}],
+                  securityGroups=[${{ steps.sg.outputs.sg_id }}],
+                  assignPublicIp=ENABLED
+                }"
+            echo "Created ECS service: $SERVICE_NAME"
+          fi
+
+      # ──────────────────────────────────────────────────────────────
+      # Summary
+      # ──────────────────────────────────────────────────────────────
+      - name: Print Summary
+        run: |
+          echo "============================================"
+          echo " Infrastructure provisioned successfully"
+          echo "============================================"
+          echo ""
+          echo " Environment:     ${{ inputs.environment }}"
+          echo " ECR Repository:  ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
+          echo " ECS Cluster:     $CLUSTER_NAME"
+          echo " ECS Service:     $SERVICE_NAME"
+          echo " Task Definition: $TASK_FAMILY"
+          echo " Container Name:  $CONTAINER_NAME"
+          echo " Log Group:       $LOG_GROUP"
+          echo " Security Group:  ${{ steps.sg.outputs.sg_id }}"
+          echo " VPC:             ${{ steps.vpc.outputs.vpc_id }}"
+          echo " Subnets:         ${{ steps.vpc.outputs.subnet_ids }}"
+          echo ""
+          echo " Next step: push code to the '${{ inputs.environment == 'qa' && 'qa' || 'main' }}'"
+          echo " branch to trigger the first deployment."
+          echo "============================================"
