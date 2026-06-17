@@ -1,82 +1,40 @@
-name: DEV Pipeline
+name: Development Pipeline
 
 on:
-
   push:
-
     branches:
-
       - dev
 
 jobs:
-
-  dev:
-
-    runs-on: self-hosted
-
+  build:
+    runs-on: ubuntu-latest
     steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - uses: actions/checkout@v4
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    - name: GitLeaks
+      - name: Install Packages
+        run: pip install -r requirements.txt
 
-      uses: gitleaks/gitleaks-action@v2
+      - name: Lint Check
+        run: pylint app.py
 
-    - name: Install dependencies
+      - name: Gitleaks Scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      run: |
+      - name: Run Unit Tests
+        run: pytest
 
-        python3 -m pip install -r requirements.txt --break-system-packages
-
-    - name: Flake8
-
-      run: |
-
-        python3 -m flake8 .
-
-    - name: Unit Tests
-
-      run: |
-
-        python3 -m pytest
-
-    - name: SonarQube
-
-      uses: SonarSource/sonarqube-scan-action@v6
-
-      env:
-
-        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-
-        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-
-    - name: Trivy FS Scan
-
-      run: |
-
-        trivy fs .
-
-    - name: Build Docker Image
-
-      run: |
-
-        docker build -t flask-app:dev-${{ github.sha }} .
-
-    - name: Trivy Image Scan
-
-      run: |
-
-        trivy image flask-app:dev-${{ github.sha }}
-
-    - name: Stop Existing Container
-
-      run: |
-
-        docker rm -f flask-dev || true
-
-    - name: Run Container
-
-      run: |
-
-        docker run -d --name flask-dev -p 5000:5000 flask-app:dev-${{ github.sha }}
-        
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
